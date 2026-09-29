@@ -108,3 +108,4 @@ VPN, proof K4 fresco y scaffolding de boot.
 XMPP rescue (08), healthd/métricas (09), matriz completa de reboot/fault tests
 (10), backup/DR (11) y aceptación 72 h (12). `fw-verify all` continúa devolviendo
 `INCOMPLETE` hasta que esos gates existan; no se presentan como terminados.
+

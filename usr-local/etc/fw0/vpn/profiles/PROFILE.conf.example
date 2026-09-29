@@ -1,0 +1,9 @@
+# wg(8) setconf format, NOT wg-quick. Must be root:wheel 0600 in production.
+[Interface]
+PrivateKey = REEMPLAZAR
+
+[Peer]
+PublicKey = REEMPLAZAR
+AllowedIPs = 0.0.0.0/0
+Endpoint = 203.0.113.10:51820
+PersistentKeepalive = 25

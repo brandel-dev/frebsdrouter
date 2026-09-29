@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+[ "$(id -u)" -eq 0 ] || { echo "Ejecutar como root/doas" >&2; exit 1; }
+ADMIN=${1:-}
+PUBKEY=${2:-}
+[ -n "$ADMIN" ] && [ -r "$PUBKEY" ] \
+    || { echo "Uso: bootstrap-remote-access <usuario> <clave-publica.pub>" >&2; exit 1; }
+pw usershow "$ADMIN" >/dev/null 2>&1 || { echo "Usuario inexistente: $ADMIN" >&2; exit 1; }
+# BUG CORREGIDO: "-7" fuerza el formato tradicional de 7 columnas
+# (name:passwd:uid:gid:gecos:home:shell), donde el home es el campo 6, no
+# el 9. Con "-7" puesto, $9 siempre venía vacío, "home" quedaba vacío, y
+# "[ -d "$home" ]" fallaba SIEMPRE aunque el usuario fuera válido -- el
+# script no podía completarse nunca. El formato por defecto (10 campos:
+# name:passwd:uid:gid:class:change:expire:gecos:home:shell) sí tiene el
+# home en el campo 9.
+home=$(pw usershow "$ADMIN" | awk -F: '{print $9}')
+[ -d "$home" ] || { echo "Home inválido para $ADMIN" >&2; exit 1; }
+admin_group=$(id -gn "$ADMIN")
+install -d -m 0700 -o "$ADMIN" -g "$admin_group" "$home/.ssh"
+install -m 0600 -o "$ADMIN" -g "$admin_group" "$PUBKEY" "$home/.ssh/authorized_keys"
+
+service tailscaled onestatus >/dev/null 2>&1 || { echo "tailscaled no está activo" >&2; exit 1; }
+TS_IP=$(tailscale ip -4 | awk 'NR==1 {print; exit}')
+printf '%s\n' "$TS_IP" | grep -Eq '^100\.[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "No se obtuvo IPv4 de Tailscale" >&2; exit 1; }
+
+CONF_DIR=/usr/local/etc/ssh/sshd_config.d
+CONF=$CONF_DIR/fw0-tailscale.conf
+install -d -m 0755 "$CONF_DIR"
+cat > "$CONF" <<EOF
+# Generado por bootstrap-remote-access
+ListenAddress $TS_IP
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+PubkeyAuthentication yes
+AllowUsers $ADMIN
+EOF
+chmod 0600 "$CONF"
+
+if ! grep -q '^Include /usr/local/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
+    cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.before-fw0
+    tmp=$(mktemp /etc/ssh/sshd_config.XXXXXX)
+    printf 'Include /usr/local/etc/ssh/sshd_config.d/*.conf\n\n' > "$tmp"
+    cat /etc/ssh/sshd_config >> "$tmp"
+    install -m 0600 "$tmp" /etc/ssh/sshd_config
+    rm -f "$tmp"
+fi
+
+sshd -t
+sysrc sshd_enable=YES >/dev/null
+service sshd restart
+sockstat -4 -l | grep -E "[[:space:]]${TS_IP}:22[[:space:]]" >/dev/null \
+    || { echo "sshd no escucha en $TS_IP:22" >&2; exit 1; }
+
+echo "SSH restringido a Tailscale: $TS_IP:22"
+echo "Pruebe dos conexiones nuevas desde Windows antes de cerrar la consola local."

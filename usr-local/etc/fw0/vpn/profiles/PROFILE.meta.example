@@ -1,0 +1,4 @@
+# Strict data file; do not add shell syntax or extra keys.
+WG_ADDRESS="10.2.0.2/32"
+WG_ENDPOINT_IP="203.0.113.10"
+WG_ENDPOINT_PORT="51820"

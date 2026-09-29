@@ -1,0 +1,71 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+CANDIDATE=${1:-/etc/pf.conf.candidate}
+ACTIVE=/etc/pf.conf
+BASE=/var/db/fw0/pf-transactions
+INV=/usr/local/etc/fw0/inventory.conf
+LIB=/usr/local/libexec/fw0/fw0-lib
+. "$LIB"
+. "$INV"
+
+[ "$(id -u)" -eq 0 ] || fw0_die "pf-safe-reload requiere root"
+[ -f "$CANDIDATE" ] || fw0_die "No existe $CANDIDATE"
+pfctl -nf "$CANDIDATE"
+fw0_is_uint "$PF_CONFIRM_TIMEOUT" && [ "$PF_CONFIRM_TIMEOUT" -ge 30 ] && [ "$PF_CONFIRM_TIMEOUT" -le 600 ] \
+    || fw0_die "PF_CONFIRM_TIMEOUT debe estar entre 30 y 600 segundos"
+
+mkdir -p "$BASE"
+chmod 0700 /var/db/fw0 "$BASE" 2>/dev/null || true
+
+tx=$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+[ -n "$tx" ] || fw0_die "no se pudo generar transaction id"
+dir="$BASE/$tx"
+mkdir -m 0700 "$dir"
+echo pending > "$dir/state"
+echo 0 > "$dir/had_old"
+fw0_pf_enabled && echo 1 > "$dir/was_enabled" || echo 0 > "$dir/was_enabled"
+if [ -f "$ACTIVE" ]; then
+    install -m 0600 "$ACTIVE" "$dir/previous.conf"
+    echo 1 > "$dir/had_old"
+fi
+install -m 0600 "$CANDIDATE" "$dir/candidate.conf"
+fw0_hash_file "$CANDIDATE" > "$dir/candidate.sha256"
+date +%s > "$dir/started_at"
+echo "$PF_CONFIRM_TIMEOUT" > "$dir/timeout"
+
+# Rollback worker is deliberately independent from the SSH session.
+nohup sh -c "sleep $PF_CONFIRM_TIMEOUT; exec /usr/local/libexec/fw0/pf-auto-rollback '$tx'" \
+    </dev/null >>/var/log/fw0-pf-rollback.log 2>&1 &
+echo $! > "$dir/rollback_pid"
+
+rollback_now() {
+    echo "Carga insegura/fallida; ejecutando rollback inmediato $tx" >&2
+    /usr/local/libexec/fw0/pf-auto-rollback "$tx" || true
+    exit 1
+}
+
+install -m 0600 "$CANDIDATE" "$ACTIVE" || rollback_now
+pfctl -f "$ACTIVE" || rollback_now
+fw0_pf_enabled || pfctl -e >/dev/null || rollback_now
+fw0_pf_enabled || rollback_now
+
+# Local sanity checks. Remote reachability is proved by confirming from a NEW SSH session.
+ifconfig "$TS_IF" >/dev/null 2>&1 || rollback_now
+ts_ip=$(tailscale ip -4 2>/dev/null | awk 'NR==1{print;exit}')
+[ -n "$ts_ip" ] || rollback_now
+sockstat -4 -l | grep -E "[[:space:]]${ts_ip}:22[[:space:]]" >/dev/null || rollback_now
+pfctl -s labels | grep -F 'fw0:block-lan-to-wan' >/dev/null || rollback_now
+pfctl -s labels | grep -F 'fw0:allow-ts-ssh' >/dev/null || rollback_now
+
+cat <<EOF2
+PF_CANDIDATE=LOADED
+TRANSACTION=$tx
+ROLLBACK_IN=${PF_CONFIRM_TIMEOUT}s
+
+Abra una NUEVA sesión SSH a través de Tailscale y, desde esa nueva sesión, ejecute:
+  doas /usr/local/libexec/fw0/pf-safe-confirm $tx
+
+Si no se confirma, la configuración anterior se restaurará automáticamente.
+EOF2

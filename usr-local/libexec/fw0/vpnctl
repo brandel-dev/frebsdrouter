@@ -1,0 +1,230 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+INV=/usr/local/etc/fw0/inventory.conf
+LIB=/usr/local/libexec/fw0/fw0-lib
+. "$LIB"
+. "$INV"
+
+VPN_DIR=/usr/local/etc/fw0/vpn
+PROFILES_DIR=$VPN_DIR/profiles
+ACTIVE=$VPN_DIR/active
+LAST_GOOD=$VPN_DIR/last-good
+STATE_JSON=$VPN_DIR/state.json
+LOCK_DIR=/var/run/fw0-vpnctl.lock
+FW0_PROFILES_DIR=$PROFILES_DIR
+export FW0_PROFILES_DIR
+
+[ "$(id -u)" -eq 0 ] || fw0_die "vpnctl requiere root"
+fw0_is_uint "$FIB_CONTROL" && fw0_is_uint "$FIB_DATA" && [ "$FIB_CONTROL" != "$FIB_DATA" ] || fw0_die "FIB inválidas"
+fw0_is_uint "$WG_MTU" && [ "$WG_MTU" -ge 576 ] && [ "$WG_MTU" -le 9000 ] || fw0_die "WG_MTU inválido"
+fw0_valid_ipv4 "$EGRESS_PROBE_IP" || fw0_die "EGRESS_PROBE_IP inválido"
+
+log() { logger -t fw0-vpnctl -- "$*"; echo "$*"; }
+
+json_safe() { printf '%s' "$1" | tr -cd 'A-Za-z0-9_.:/+-'; }
+write_state() {
+    state=$(json_safe "$1")
+    profile=$(json_safe "${2:-}")
+    endpoint=$(json_safe "${3:-}")
+    probe_ok=$(json_safe "${4:-false}")
+    last_good=$(cat "$LAST_GOOD" 2>/dev/null || true)
+    last_good=$(json_safe "$last_good")
+    hs_age=null
+    if fw0_iface_exists "$WG_IF"; then
+        now=$(date +%s)
+        hs=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{m=0} $2>m{m=$2} END{print m}')
+        if [ "${hs:-0}" -gt 0 ] 2>/dev/null; then hs_age=$((now - hs)); fi
+    fi
+    tmp=$(mktemp "$VPN_DIR/state.json.XXXXXX")
+    cat > "$tmp" <<JSON
+{"state":"$state","profile":"$profile","last_good":"$last_good","endpoint":"$endpoint","probe_ip":"$EGRESS_PROBE_IP","probe_ok":$probe_ok,"handshake_age":$hs_age,"updated_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+JSON
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$STATE_JSON"
+}
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid"
+        trap 'rm -rf "$LOCK_DIR"' EXIT HUP INT TERM
+        return 0
+    fi
+    oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '')
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        fw0_die "vpnctl ya está en ejecución (pid $oldpid)"
+    fi
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR"
+    echo $$ > "$LOCK_DIR/pid"
+    trap 'rm -rf "$LOCK_DIR"' EXIT HUP INT TERM
+}
+
+load_profile() {
+    profile=$1
+    fw0_profile_validate "$profile" || return 1
+    META=$FW0_PROFILE_META
+    WG_CONF=$FW0_PROFILE_CONF
+}
+
+retire_default_route() {
+    if route -n get -fib "$FIB_DATA" default >/dev/null 2>&1; then
+        route delete -fib "$FIB_DATA" default >/dev/null || return 1
+    fi
+    ! route -n get -fib "$FIB_DATA" default >/dev/null 2>&1
+}
+
+kill_lan_states() {
+    fw0_pf_enabled || return 0
+    fw0_iface_exists "$WG_IF" || return 0
+    pfctl -M -i "$WG_IF" -k 0.0.0.0/0 >/dev/null || return 1
+}
+
+destroy_wg() {
+    if fw0_iface_exists "$WG_IF"; then
+        ifconfig "$WG_IF" destroy >/dev/null || return 1
+    fi
+    ! fw0_iface_exists "$WG_IF"
+}
+
+cleanup_data_plane() {
+    rc=0
+    retire_default_route || { log "ERROR: no se pudo retirar default FIB $FIB_DATA"; rc=1; }
+    kill_lan_states || { log "ERROR: no se pudieron purgar estados PF de $WG_IF"; rc=1; }
+    destroy_wg || { log "ERROR: no se pudo destruir $WG_IF"; rc=1; }
+    return "$rc"
+}
+
+ensure_endpoint_allowed() {
+    fw0_pf_enabled || return 0
+    pfctl -t vpn_endpoints -T add "$WG_ENDPOINT_IP" >/dev/null
+}
+
+apply_profile() {
+    profile=$1
+    load_profile "$profile" || { log "perfil inválido: $profile"; return 1; }
+    ensure_endpoint_allowed || return 1
+    ifconfig "$WG_IF" create || return 1
+    ifconfig "$WG_IF" fib "$FIB_DATA" || return 1
+    ifconfig "$WG_IF" tunnelfib "$FIB_CONTROL" || return 1
+    ifconfig "$WG_IF" inet "$WG_ADDRESS" || return 1
+    ifconfig "$WG_IF" mtu "$WG_MTU" || return 1
+    wg setconf "$WG_IF" "$WG_CONF" || return 1
+    ifconfig "$WG_IF" up || return 1
+    ifconfig "$WG_IF" | grep -q "fib: $FIB_DATA" || return 1
+    ifconfig "$WG_IF" | grep -q "tunnelfib: $FIB_CONTROL" || return 1
+}
+
+add_probe_route() {
+    route delete -fib "$FIB_DATA" -host "$EGRESS_PROBE_IP" >/dev/null 2>&1 || :
+    route add -fib "$FIB_DATA" -host "$EGRESS_PROBE_IP" -interface "$WG_IF" >/dev/null || return 1
+    route -n get -fib "$FIB_DATA" "$EGRESS_PROBE_IP" | grep -q "interface: $WG_IF"
+}
+
+del_probe_route() {
+    route -n get -fib "$FIB_DATA" "$EGRESS_PROBE_IP" >/dev/null 2>&1 || return 0
+    route delete -fib "$FIB_DATA" -host "$EGRESS_PROBE_IP" >/dev/null || return 1
+}
+
+wait_fresh_handshake() {
+    tries=0
+    while [ "$tries" -lt 35 ]; do
+        now=$(date +%s)
+        hs=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{m=0} $2>m{m=$2} END{print m}')
+        if [ "${hs:-0}" -gt 0 ] 2>/dev/null && [ $((now - hs)) -le 30 ]; then return 0; fi
+        tries=$((tries + 1))
+        sleep 1
+    done
+    return 1
+}
+
+probe_egress() { setfib "$FIB_DATA" ping -c 2 -t 5 "$EGRESS_PROBE_IP" >/dev/null 2>&1; }
+
+install_default_route() {
+    retire_default_route || return 1
+    route add -fib "$FIB_DATA" default -interface "$WG_IF" >/dev/null || return 1
+    route -n get -fib "$FIB_DATA" "$EGRESS_PROBE_IP" | grep -q "interface: $WG_IF"
+}
+
+activate_profile() {
+    profile=$1
+    load_profile "$profile" || return 1
+    endpoint="$WG_ENDPOINT_IP:$WG_ENDPOINT_PORT"
+    write_state CONNECTING "$profile" "$endpoint" false
+    apply_profile "$profile" || return 1
+
+    # Prove the tunnel with one host route. General client default still does not exist.
+    add_probe_route || return 1
+    if setfib "$FIB_DATA" ping -c 1 -t 3 "$EGRESS_PROBE_IP" >/dev/null 2>&1; then :; else :; fi
+    wait_fresh_handshake || { del_probe_route || :; return 1; }
+    probe_egress || { del_probe_route || :; return 1; }
+    del_probe_route || return 1
+
+    # The data-plane default route is the LAST privilege granted.
+    install_default_route || return 1
+    probe_egress || return 1
+
+    printf '%s\n' "$profile" > "$ACTIVE"
+    printf '%s\n' "$profile" > "$LAST_GOOD"
+    chmod 0600 "$ACTIVE" "$LAST_GOOD"
+    write_state HEALTHY "$profile" "$endpoint" true
+    log "HEALTHY: perfil $profile; default FIB $FIB_DATA -> $WG_IF"
+}
+
+enter_quarantine() {
+    profile=${1:-unknown}
+    cleanup_data_plane || log "ALERTA: cuarentena con error durante cleanup; revise consola"
+    rm -f "$ACTIVE"
+    write_state QUARANTINE "$profile" '' false
+    log "QUARANTINE: FIB $FIB_DATA sin default; plano de control conservado"
+    exit 2
+}
+
+cmd_switch() {
+    target=$1
+    fw0_valid_profile "$target" || fw0_die "nombre de perfil inválido"
+    acquire_lock
+    load_profile "$target" || fw0_die "perfil inexistente/inválido: $target"
+    previous=$(cat "$LAST_GOOD" 2>/dev/null || true)
+
+    cleanup_data_plane || enter_quarantine "$target"
+    if activate_profile "$target"; then return 0; fi
+
+    log "falló $target; retirando cualquier privilegio de datos"
+    cleanup_data_plane || enter_quarantine "$target"
+
+    if [ -n "$previous" ] && [ "$previous" != "$target" ] && fw0_valid_profile "$previous"; then
+        write_state ROLLBACK "$previous" '' false
+        if activate_profile "$previous"; then
+            log "ROLLBACK_OK: restaurado $previous"
+            exit 3
+        fi
+        cleanup_data_plane || :
+    fi
+    enter_quarantine "$target"
+}
+
+cmd_down() {
+    acquire_lock
+    cleanup_data_plane || enter_quarantine manual
+    rm -f "$ACTIVE"
+    write_state DOWN '' '' false
+    log "DOWN: data plane retirado de forma controlada"
+}
+
+cmd_status() {
+    [ -f "$STATE_JSON" ] && cat "$STATE_JSON" || echo '{"state":"UNKNOWN"}'
+    wg show "$WG_IF" 2>/dev/null || echo "$WG_IF no existe"
+    route -n get -fib "$FIB_DATA" default 2>/dev/null || echo "FIB $FIB_DATA sin default"
+}
+
+case "${1:-}" in
+    status) cmd_status ;;
+    switch) [ -n "${2:-}" ] || { echo "Uso: vpnctl switch <perfil>"; exit 64; }; cmd_switch "$2" ;;
+    restart) p=$(cat "$ACTIVE" 2>/dev/null || true); [ -n "$p" ] || fw0_die "no hay perfil activo"; cmd_switch "$p" ;;
+    restore-last-good) p=$(cat "$LAST_GOOD" 2>/dev/null || true); [ -n "$p" ] || fw0_die "no hay last-good"; cmd_switch "$p" ;;
+    down) cmd_down ;;
+    *) echo "Uso: vpnctl {status|switch <perfil>|restart|restore-last-good|down}" >&2; exit 64 ;;
+esac

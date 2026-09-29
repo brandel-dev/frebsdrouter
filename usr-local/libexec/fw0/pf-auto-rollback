@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+BASE=/var/db/fw0/pf-transactions
+LIB=/usr/local/libexec/fw0/fw0-lib
+. "$LIB"
+
+tx=${1:-}
+fw0_valid_profile "$tx" || fw0_die "transaction id inválido"
+dir="$BASE/$tx"
+[ -d "$dir" ] || exit 0
+state=$(cat "$dir/state" 2>/dev/null || echo pending)
+[ "$state" = pending ] || exit 0
+
+had_old=$(cat "$dir/had_old")
+was_enabled=$(cat "$dir/was_enabled")
+logger -t fw0-pf "rollback automático de transacción $tx"
+
+if [ "$had_old" = 1 ] && [ -f "$dir/previous.conf" ]; then
+    install -m 0600 "$dir/previous.conf" /etc/pf.conf
+    if ! pfctl -f /etc/pf.conf; then
+        logger -t fw0-pf "CRITICAL: no se pudo recargar previous.conf en rollback $tx"
+        pfctl -d >/dev/null 2>&1 || true
+        echo rolled-back-failed > "$dir/state"
+        exit 1
+    fi
+else
+    rm -f /etc/pf.conf
+fi
+
+if [ "$was_enabled" = 1 ]; then
+    fw0_pf_enabled || pfctl -e >/dev/null
+else
+    fw0_pf_enabled && pfctl -d >/dev/null || true
+fi
+
+echo rolled-back > "$dir/state"
+logger -t fw0-pf "rollback $tx completado"

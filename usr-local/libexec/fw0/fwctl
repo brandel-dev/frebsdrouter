@@ -1,0 +1,123 @@
+#!/bin/sh
+# /usr/local/libexec/fw0/fwctl
+# Único binario que xmpprescue puede invocar vía doas. NO acepta shell, NO
+# acepta argumentos arbitrarios para pfctl/service, NO lee/escribe archivos
+# fuera de lo enumerado aquí. Cada comando es una rama fija, sin eval.
+#
+# doas.conf debe contener EXACTAMENTE:
+#   permit nopass xmpprescue as root cmd /usr/local/libexec/fw0/fwctl
+#
+# Uso: fwctl <comando> [arg]
+#   status | vpn-list | vpn-status | vpn-switch <PROFILE> | vpn-restart
+#   vpn-restore | pf-status | route-status | management-status
+#   reboot-token | reboot-confirm <TOKEN>
+
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+VPNCTL="/usr/local/libexec/fw0/vpnctl"
+PROFILES_DIR="/usr/local/etc/fw0/vpn/profiles"
+TOKEN_FILE="/var/run/fw0-reboot.token"
+INV="/usr/local/etc/fw0/inventory.conf"
+. "$INV"
+
+# Whitelist estricta de nombres de perfil: solo [a-z0-9-], nada de rutas ni
+# metacaracteres. Esto es lo que impide que "vpn-switch ../../algo" haga nada.
+valid_profile() {
+    echo "$1" | grep -Eq '^[a-z0-9-]{1,32}$'
+}
+
+cmd_status() {
+    echo "=== fw0 status ==="
+    "$VPNCTL" status
+    echo "--- pf ---"
+    pfctl -s info | grep -E 'Status|State Table'
+    echo "--- route fib $FIB_DATA ---"
+    route -n get -fib "$FIB_DATA" default 2>&1 || echo "no route (esperado si VPN caída)"
+}
+
+cmd_vpn_list() {
+    for file in "$PROFILES_DIR"/*.conf; do
+        [ -f "$file" ] || continue
+        name=${file##*/}; name=${name%.conf}
+        valid_profile "$name" && echo "$name"
+    done
+}
+
+cmd_vpn_status() {
+    "$VPNCTL" status
+}
+
+cmd_vpn_switch() {
+    profile="${1:-}"
+    valid_profile "$profile" || { echo "perfil inválido"; exit 1; }
+    [ -f "$PROFILES_DIR/${profile}.conf" ] || { echo "perfil no existe"; exit 1; }
+    "$VPNCTL" switch "$profile"
+}
+
+cmd_vpn_restart() {
+    "$VPNCTL" restart
+}
+
+cmd_vpn_restore() {
+    "$VPNCTL" restore-last-good
+}
+
+cmd_pf_status() {
+    pfctl -s info
+    pfctl -s rules | head -50
+}
+
+cmd_route_status() {
+    echo "--- FIB $FIB_CONTROL (control) ---"
+    route -n get -fib "$FIB_CONTROL" default
+    echo "--- FIB $FIB_DATA (data/VPN) ---"
+    route -n get -fib "$FIB_DATA" default 2>&1 || echo "sin default (killswitch OK si VPN caída)"
+}
+
+cmd_management_status() {
+    service tailscaled status 2>&1 || true
+    service zerotier status 2>&1 || true
+}
+
+cmd_reboot_token() {
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$TOKEN_FILE"
+    chmod 0600 "$TOKEN_FILE"
+    # El token expira solo: se borra al usarse o queda huérfano y no sirve tras reboot.
+    echo "TOKEN=$tok (usar: reboot-confirm <TOKEN> en los próximos 2 minutos)"
+}
+
+cmd_reboot_confirm() {
+    given="${1:-}"
+    [ -f "$TOKEN_FILE" ] || { echo "no hay token pendiente"; exit 1; }
+    saved=$(cat "$TOKEN_FILE")
+    age=$(( $(date +%s) - $(stat -f %m "$TOKEN_FILE" 2>/dev/null || stat -c %Y "$TOKEN_FILE") ))
+    if [ "$given" = "$saved" ] && [ "$age" -lt 120 ]; then
+        rm -f "$TOKEN_FILE"
+        logger -t fwctl "reboot confirmado vía fwctl/xmpp"
+        /sbin/reboot
+    else
+        echo "token inválido o expirado"
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    status)              cmd_status ;;
+    vpn-list)            cmd_vpn_list ;;
+    vpn-status)          cmd_vpn_status ;;
+    vpn-switch)           cmd_vpn_switch "${2:-}" ;;
+    vpn-restart)         cmd_vpn_restart ;;
+    vpn-restore)         cmd_vpn_restore ;;
+    pf-status)           cmd_pf_status ;;
+    route-status)        cmd_route_status ;;
+    management-status)   cmd_management_status ;;
+    reboot-token)        cmd_reboot_token ;;
+    reboot-confirm)       cmd_reboot_confirm "${2:-}" ;;
+    *)
+        echo "Comando no reconocido. Comandos válidos: status vpn-list vpn-status vpn-switch vpn-restart vpn-restore pf-status route-status management-status reboot-token reboot-confirm"
+        exit 1
+        ;;
+esac

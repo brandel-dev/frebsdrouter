@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+INV=/usr/local/etc/fw0/inventory.conf
+LIB=/usr/local/libexec/fw0/fw0-lib
+VPN_DIR=/usr/local/etc/fw0/vpn
+PROOF=/var/db/fw0/gate04-k4.ok
+. "$LIB"
+. "$INV"
+
+[ "$(id -u)" -eq 0 ] || fw0_die "k4-record requiere root"
+[ "${1:-}" = 'I_OBSERVED_K4_A_B_C_D_E' ] || {
+    echo "Uso: k4-record I_OBSERVED_K4_A_B_C_D_E" >&2
+    echo "Ejecutarlo solo después de observar manualmente K4-A/B/C/D/E desde consola." >&2
+    exit 64
+}
+profile=$(cat "$VPN_DIR/active" 2>/dev/null || true)
+fw0_valid_profile "$profile" || fw0_die "no hay perfil activo válido"
+FW0_PROFILES_DIR=$VPN_DIR/profiles; export FW0_PROFILES_DIR
+fw0_profile_validate "$profile" || fw0_die "perfil activo inválido"
+[ -r /etc/pf.conf ] || fw0_die "falta /etc/pf.conf"
+mkdir -p /var/db/fw0
+version=$(freebsd-version -ku 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+[ -n "$version" ] || version=$(uname -K)
+
+tmp=$(mktemp /var/db/fw0/gate04-k4.XXXXXX)
+cat > "$tmp" <<EOF2
+VERSION=2
+RECORDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+FREEBSD_VERSION=$version
+WAN_IF=$WAN_IF
+LAN_IF=$LAN_IF
+LAN2_IF=$LAN2_IF
+WG_IF=$WG_IF
+PROFILE=$profile
+INVENTORY_SHA256=$(fw0_hash_file "$INV")
+PF_SHA256=$(fw0_hash_file /etc/pf.conf)
+PROFILE_CONF_SHA256=$(fw0_hash_file "$FW0_PROFILE_CONF")
+PROFILE_META_SHA256=$(fw0_hash_file "$FW0_PROFILE_META")
+K4_A=PASS
+K4_B=PASS
+K4_C=PASS
+K4_D=PASS
+K4_E=PASS
+EOF2
+chmod 0600 "$tmp"
+mv -f "$tmp" "$PROOF"
+echo "K4_PROOF=RECORDED profile=$profile proof=$PROOF"

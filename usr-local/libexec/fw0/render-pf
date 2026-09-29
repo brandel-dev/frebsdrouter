@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+INV=/usr/local/etc/fw0/inventory.conf
+TEMPLATE=/usr/local/etc/fw0/templates/pf.conf.in
+OUT=/etc/pf.conf.candidate
+LIB=/usr/local/libexec/fw0/fw0-lib
+[ -r "$LIB" ] || LIB="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/fw0-lib"
+. "$LIB"
+
+[ "$(id -u)" -eq 0 ] || fw0_die "render-pf requiere root"
+[ -r "$INV" ] && [ -r "$TEMPLATE" ] || fw0_die "Falta inventario o plantilla"
+. "$INV"
+
+for v in WAN_IF LAN_IF LAN2_IF TS_IF WG_IF; do
+    eval value=\"\${$v}\"
+    fw0_valid_if "$value" || fw0_die "$v inválida"
+done
+fw0_valid_cidr4 "$LAN_NET" || fw0_die "LAN_NET inválida"
+fw0_valid_cidr4 "$LAN2_NET" || fw0_die "LAN2_NET inválida"
+fw0_valid_port "$TS_UDP_PORT" || fw0_die "TS_UDP_PORT inválido"
+fw0_is_uint "$WG_MSS_V4" && [ "$WG_MSS_V4" -ge 536 ] && [ "$WG_MSS_V4" -le 8960 ] || fw0_die "WG_MSS_V4 inválido"
+
+# Keep the persistent PF table synchronized with all known profile endpoints.
+/usr/local/libexec/fw0/rebuild-vpn-endpoints
+
+tmp=$(mktemp /etc/pf.conf.candidate.XXXXXX)
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+sed -e "s|@WAN_IF@|$WAN_IF|g" \
+    -e "s|@LAN_IF@|$LAN_IF|g" \
+    -e "s|@LAN2_IF@|$LAN2_IF|g" \
+    -e "s|@TS_IF@|$TS_IF|g" \
+    -e "s|@WG_IF@|$WG_IF|g" \
+    -e "s|@LAN_NET@|$LAN_NET|g" \
+    -e "s|@LAN2_NET@|$LAN2_NET|g" \
+    -e "s|@TS_UDP_PORT@|$TS_UDP_PORT|g" \
+    -e "s|@WG_MSS_V4@|$WG_MSS_V4|g" \
+    "$TEMPLATE" > "$tmp"
+
+grep -q '@[A-Z_][A-Z_]*@' "$tmp" && fw0_die "Quedaron marcadores sin sustituir"
+pfctl -nf "$tmp"
+install -m 0600 "$tmp" "$OUT"
+echo "Candidato generado y validado: $OUT"

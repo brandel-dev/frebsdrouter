@@ -1,0 +1,3 @@
+# REQUIRED before Gate 03. One IPv4 resolver used by /etc/resolv.conf per line.
+# Example only (remove the leading # after deciding your control-plane resolver):
+# 1.1.1.1

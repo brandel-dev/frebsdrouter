@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+DIR=/usr/local/libexec/fw0
+run_one() {
+    n=$1; script="$DIR/verify-${n}.sh"
+    [ -x "$script" ] || { echo "GATE${n}=INCOMPLETE (sin verificador)"; return 2; }
+    "$script"
+}
+case "${1:-}" in
+    all)
+        incomplete=0
+        for n in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
+            if run_one "$n"; then :; else
+                rc=$?
+                [ "$rc" -eq 2 ] && { incomplete=1; continue; }
+                echo "GATE${n}=FAIL; detenido"; exit 1
+            fi
+        done
+        [ "$incomplete" -eq 0 ] || { echo "RESULTADO=INCOMPLETE"; exit 2; }
+        echo "RESULTADO=PASS"
+        ;;
+    00|01|02|03|04|05|06|07|08|09|10|11|12) run_one "$1" ;;
+    *) echo "Uso: fw-verify {00|01|...|12|all}" >&2; exit 64 ;;
+esac

@@ -1,0 +1,27 @@
+#!/bin/sh
+# PROVIDE: fw0_vpn
+# REQUIRE: NETWORKING pf tailscaled fw0_preflight
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+name=fw0_vpn
+rcvar=fw0_vpn_enable
+start_cmd=fw0_vpn_start
+stop_cmd=fw0_vpn_stop
+load_rc_config "$name"
+: ${fw0_vpn_enable:=NO}
+
+fw0_vpn_start() {
+    . /usr/local/libexec/fw0/fw0-lib
+    . /usr/local/etc/fw0/inventory.conf
+    fw0_pf_enabled || { logger -t fw0 "VPN no inicia: PF apagado"; return 1; }
+    [ -r /etc/pf.conf ] && [ -r /etc/pf.conf.lastgood ] || { logger -t fw0 "VPN no inicia: PF sin last-good"; return 1; }
+    [ "$(fw0_hash_file /etc/pf.conf)" = "$(fw0_hash_file /etc/pf.conf.lastgood)" ] || { logger -t fw0 "VPN no inicia: PF activo no confirmado"; return 1; }
+    profile=$(cat /usr/local/etc/fw0/vpn/last-good 2>/dev/null || true)
+    [ -n "$profile" ] || { logger -t fw0 "VPN no inicia: no hay last-good profile"; return 1; }
+    /usr/local/libexec/fw0/vpnctl switch "$profile"
+}
+fw0_vpn_stop() {
+    /usr/local/libexec/fw0/vpnctl down || true
+}
+run_rc_command "$1"

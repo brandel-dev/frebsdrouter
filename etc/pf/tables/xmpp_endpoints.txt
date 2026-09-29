@@ -1,0 +1,1 @@
+# IPv4 endpoints authorized for the future XMPP rescue service.

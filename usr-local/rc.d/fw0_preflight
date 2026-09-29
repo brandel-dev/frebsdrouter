@@ -1,0 +1,29 @@
+#!/bin/sh
+# PROVIDE: fw0_preflight
+# REQUIRE: NETWORKING
+# BEFORE: fw0_vpn
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+name=fw0_preflight
+rcvar=fw0_preflight_enable
+start_cmd=fw0_preflight_start
+stop_cmd=":"
+load_rc_config "$name"
+: ${fw0_preflight_enable:=NO}
+
+fw0_preflight_start() {
+    . /usr/local/etc/fw0/inventory.conf
+    # Fail-close first: FIB data must never inherit/retain a WAN default.
+    if route -n get -fib "$FIB_DATA" default >/dev/null 2>&1; then
+        route delete -fib "$FIB_DATA" default >/dev/null || return 1
+    fi
+    [ "$(sysctl -n net.fibs)" -ge 2 ] || { logger -t fw0 "net.fibs < 2"; return 1; }
+    ifconfig "$WAN_IF" fib "$FIB_CONTROL" || return 1
+    ifconfig "$LAN_IF" fib "$FIB_DATA" || return 1
+    ifconfig "$LAN2_IF" fib "$FIB_DATA" || return 1
+    sysctl net.inet.ip.forwarding=1 >/dev/null || return 1
+    sysctl net.inet6.ip6.forwarding=0 >/dev/null || return 1
+    logger -t fw0 "preflight OK: FIB $FIB_DATA sin default"
+}
+run_rc_command "$1"

@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+BASE=/var/db/fw0/pf-transactions
+ACTIVE=/etc/pf.conf
+LASTGOOD=/etc/pf.conf.lastgood
+INV=/usr/local/etc/fw0/inventory.conf
+LIB=/usr/local/libexec/fw0/fw0-lib
+. "$LIB"
+. "$INV"
+
+tx=${1:-}
+[ "$(id -u)" -eq 0 ] || fw0_die "pf-safe-confirm requiere root"
+fw0_valid_profile "$tx" || fw0_die "transaction id inválido"
+dir="$BASE/$tx"
+[ -d "$dir" ] || fw0_die "transacción inexistente/expirada: $tx"
+[ "$(cat "$dir/state" 2>/dev/null)" = pending ] || fw0_die "transacción ya cerrada"
+
+expected=$(cat "$dir/candidate.sha256")
+actual=$(fw0_hash_file "$ACTIVE")
+[ "$expected" = "$actual" ] || fw0_die "el ruleset activo cambió desde la carga candidata"
+fw0_pf_enabled || fw0_die "PF no está enabled"
+service tailscaled onestatus >/dev/null 2>&1 || fw0_die "tailscaled no está activo"
+ifconfig "$TS_IF" >/dev/null 2>&1 || fw0_die "$TS_IF no existe"
+ts_ip=$(tailscale ip -4 2>/dev/null | awk 'NR==1{print;exit}')
+[ -n "$ts_ip" ] || fw0_die "sin IPv4 Tailscale"
+sockstat -4 -l | grep -E "[[:space:]]${ts_ip}:22[[:space:]]" >/dev/null || fw0_die "sshd no escucha en la IP Tailscale"
+
+# Commit persistence only after all checks above pass.
+install -m 0600 "$ACTIVE" "$LASTGOOD"
+sysrc pf_enable=YES >/dev/null
+sysrc pf_rules="$ACTIVE" >/dev/null
+printf '%s\n' committed > "$dir/state.tmp"
+mv -f "$dir/state.tmp" "$dir/state"
+logger -t fw0-pf "PF transaction $tx committed"
+echo "PF_COMMIT=PASS transaction=$tx lastgood=$LASTGOOD"

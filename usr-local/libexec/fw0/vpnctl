@@ -114,7 +114,13 @@ apply_profile() {
     wg setconf "$WG_IF" "$WG_CONF" || return 1
     ifconfig "$WG_IF" up || return 1
     ifconfig "$WG_IF" | grep -q "fib: $FIB_DATA" || return 1
-    ifconfig "$WG_IF" | grep -q "tunnelfib: $FIB_CONTROL" || return 1
+    # FreeBSD omits the tunnelfib field when its value is the default 0.
+    tunnelfib=$(ifconfig "$WG_IF" | awk '/tunnelfib:/ {print $2; exit}')
+    if [ "$FIB_CONTROL" = 0 ]; then
+        [ -z "$tunnelfib" ] || [ "$tunnelfib" = 0 ] || return 1
+    else
+        [ "$tunnelfib" = "$FIB_CONTROL" ] || return 1
+    fi
 }
 
 add_probe_route() {

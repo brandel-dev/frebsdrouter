@@ -11,7 +11,12 @@ PROOF=/var/db/fw0/gate04-k4.ok
 
 ifconfig "$WG_IF" >/dev/null 2>&1 || { echo "GATE04=FAIL ($WG_IF no existe)"; exit 1; }
 ifconfig "$WG_IF" | grep -q "fib: $FIB_DATA" || { echo "GATE04=FAIL (fib incorrecta)"; exit 1; }
-ifconfig "$WG_IF" | grep -q "tunnelfib: $FIB_CONTROL" || { echo "GATE04=FAIL (tunnelfib incorrecta)"; exit 1; }
+tunnelfib=$(ifconfig "$WG_IF" | awk '/tunnelfib:/ {print $2; exit}')
+if [ "$FIB_CONTROL" = 0 ]; then
+    [ -z "$tunnelfib" ] || [ "$tunnelfib" = 0 ] || { echo "GATE04=FAIL (tunnelfib incorrecta)"; exit 1; }
+else
+    [ "$tunnelfib" = "$FIB_CONTROL" ] || { echo "GATE04=FAIL (tunnelfib incorrecta)"; exit 1; }
+fi
 
 profile=$(cat "$VPN_DIR/active" 2>/dev/null || true)
 fw0_valid_profile "$profile" || { echo "GATE04=FAIL (sin perfil activo válido)"; exit 1; }
